@@ -159,7 +159,7 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
  */
 bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) { 
   if (page_table_.find(page_id) == page_table_.end()) {
-    return false;
+    return true;
   }
 
   if (page_id == INVALID_PAGE_ID) {
@@ -170,14 +170,14 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
   if (pages_[frame_id].pin_count_ == 0) {
     return false;
   }
-
+  if (is_dirty) {
+    pages_[frame_id].is_dirty_ = is_dirty;
+  }
   pages_[frame_id].pin_count_--;
   if (pages_[frame_id].pin_count_ == 0) {
     replacer_->Unpin(frame_id);
   }
-  if (is_dirty) {
-    pages_[frame_id].is_dirty_ = is_dirty;
-  }
+  
 
   return true; 
 }

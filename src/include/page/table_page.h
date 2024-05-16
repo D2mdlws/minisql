@@ -29,6 +29,12 @@
 
 class TablePage : public Page {
  public:
+  enum UpdateStatus {
+    slotNumInvalid = 0,
+    tupleDeleted = 1,
+    notEnoughSpace = 2,
+    updateSuccess = 3
+  };
   void Init(page_id_t page_id, page_id_t prev_id, LogManager *log_mgr, Txn *txn);
 
   page_id_t GetTablePageId() { return *reinterpret_cast<page_id_t *>(GetData()); }
@@ -37,7 +43,8 @@ class TablePage : public Page {
 
   page_id_t GetNextPageId() { return *reinterpret_cast<page_id_t *>(GetData() + OFFSET_NEXT_PAGE_ID); }
 
-  void SetPrevPageId(page_id_t prev_page_id) {
+  // GetData will return the first addr of the page, then we can access the prev_ptr by offset
+  void SetPrevPageId(page_id_t prev_page_id) { 
     memcpy(GetData() + OFFSET_PREV_PAGE_ID, &prev_page_id, sizeof(page_id_t));
   }
 
@@ -49,7 +56,7 @@ class TablePage : public Page {
 
   bool MarkDelete(const RowId &rid, Txn *txn, LockManager *lock_manager, LogManager *log_manager);
 
-  bool UpdateTuple(const Row &new_row, Row *old_row, Schema *schema, Txn *txn, LockManager *lock_manager,
+  TablePage::UpdateStatus UpdateTuple(Row &new_row, Row *old_row, Schema *schema, Txn *txn, LockManager *lock_manager,
                    LogManager *log_manager);
 
   void ApplyDelete(const RowId &rid, Txn *txn, LogManager *log_manager);
