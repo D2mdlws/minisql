@@ -153,7 +153,7 @@ bool DiskManager::IsPageFree(page_id_t logical_page_id) {
   page_id_t physical_page_id = extent_id * (BITMAP_SIZE + 1) + 1;
   uint32_t page_offset;
 
-  if (extent_id >= meta_page->GetExtentNums()) {
+  if (extent_id > meta_page->GetExtentNums()) {
     LOG(ERROR) << "Invalid extent id" << std::endl;
     return false;
   }
