@@ -82,10 +82,22 @@ uint32_t IndexMetadata::DeserializeFrom(char *buf, IndexMetadata *&index_meta) {
 }
 
 Index *IndexInfo::CreateIndex(BufferPoolManager *buffer_pool_manager, const string &index_type) {
+  // size_t max_size = 0;
+  // for (auto col : key_schema_->GetColumns()) {
+  //   max_size += col->GetLength();
+  // }
   size_t max_size = 0;
+  uint32_t column_cnt = key_schema_->GetColumns().size();
+  size_t size_bitmap = (column_cnt % 8) ? column_cnt / 8 + 1 : column_cnt / 8;
+  // column_cnt + bitmap
+  max_size += 4 + sizeof(unsigned char) * size_bitmap;
   for (auto col : key_schema_->GetColumns()) {
+    // length of char column
+    if(col->GetType() == TypeId::kTypeChar)
+      max_size += 4;
     max_size += col->GetLength();
   }
+
 
   if (index_type == "bptree") {
     if (max_size <= 8)

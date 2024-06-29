@@ -6,14 +6,17 @@
  * TODO: Student Implement
  */
 template <size_t PageSize>
-bool BitmapPage<PageSize>::AllocatePage(uint32_t &page_offset) { 
+bool BitmapPage<PageSize>::AllocatePage(uint32_t &page_offset) {
   // Check if the bitmap page is full
   if (page_allocated_ == GetMaxSupportedSize()) {
     return false;
   }
-
-  SetPageAllocated(next_free_page_);
   page_offset = next_free_page_;
+  if(!IsPageFree(page_offset) || page_offset >= GetMaxSupportedSize()) {
+    return false;
+  }
+  // Mark the page as allocated
+  SetPageAllocated(next_free_page_);
   page_allocated_++;
   // Find the next free page
   bool flag = false;

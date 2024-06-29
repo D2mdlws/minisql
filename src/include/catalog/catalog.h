@@ -56,6 +56,15 @@ class CatalogMeta {
     return true;
   }
 
+  bool DeleteTableMetaPage(BufferPoolManager *bpm, table_id_t table_id) {
+    if (table_meta_pages_.find(table_id) == table_meta_pages_.end()) {
+      return false;
+    }
+    bpm->DeletePage(table_meta_pages_[table_id]);
+    table_meta_pages_.erase(table_id);
+    return true;
+  }
+
  private:
   CatalogMeta();
 

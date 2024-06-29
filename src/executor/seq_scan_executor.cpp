@@ -49,7 +49,8 @@ void SeqScanExecutor::Init() {
 bool SeqScanExecutor::Next(Row *row, RowId *rid) {
   auto predicate = plan_->GetPredicate();
   auto table_schema = table_info_->GetSchema();
-  while (iterator_ != table_info_->GetTableHeap()->End()) {
+  TableIterator tmp = table_info_->GetTableHeap()->End();
+  while (iterator_ != tmp) {
     auto p_row = &(*iterator_);
     if (predicate != nullptr) {
       if (!predicate->Evaluate(p_row).CompareEquals(Field(kTypeInt, 1))) {

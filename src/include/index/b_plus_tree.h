@@ -41,6 +41,8 @@ class BPlusTree {
   // return the value associated with a given key
   bool GetValue(const GenericKey *key, std::vector<RowId> &result, Txn *transaction = nullptr);
 
+  Page* FindRightMostLeafPage(page_id_t page_id);
+
   IndexIterator Begin();
 
   IndexIterator Begin(const GenericKey *key);
@@ -55,6 +57,10 @@ class BPlusTree {
 
   // destroy the b plus tree
   void Destroy(page_id_t current_page_id = INVALID_PAGE_ID);
+
+  inline page_id_t GetRootPageId() const {
+    return root_page_id_;
+  }
 
   void PrintTree(std::ofstream &out, Schema *schema) {
     if (IsEmpty()) {
@@ -94,6 +100,8 @@ class BPlusTree {
   bool AdjustRoot(BPlusTreePage *node);
 
   void UpdateRootPageId(int insert_record = 0);
+
+
 
   /* Debug Routines for FREE!! */
   void ToGraph(BPlusTreePage *page, BufferPoolManager *bpm, std::ofstream &out, Schema *schema) const;

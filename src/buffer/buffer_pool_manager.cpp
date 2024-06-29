@@ -49,26 +49,24 @@ Page *BufferPoolManager::FetchPage(page_id_t page_id) {
     return nullptr;
   } else
   {
-    frame_id_t frame_id = TryToFindFreePage();  // 1.2
-    if (frame_id == INVALID_PAGE_ID) {
+    frame_id_t frame_id = TryToFindFreePage();  // 1.2获取一个空闲的frame
+    if (frame_id == INVALID_FRAME_ID ) {
       return nullptr;
     }
-    if (pages_[frame_id].IsDirty()) { // 2
+    if (pages_[frame_id].IsDirty()) { // 2 from lru
       FlushPage(pages_[frame_id].GetPageId());
-      pages_[frame_id].is_dirty_ = false;
     }
 
-    page_table_.erase(pages_[frame_id].GetPageId());
+    page_table_.erase(pages_[frame_id].GetPageId()); // 通过frame_id获取page_id
+    disk_manager_->ReadPage(page_id, pages_[frame_id].data_); // 从disk上读取逻辑页号为page_id的数据
     page_table_.insert({page_id, frame_id});
     pages_[frame_id].page_id_ = page_id;
-    pages_[frame_id].pin_count_ ++;
+    pages_[frame_id].pin_count_ = 1;
     pages_[frame_id].is_dirty_ = false;
-    replacer_->Pin(frame_id);
-    pages_[frame_id].ResetMemory();
-    disk_manager_->ReadPage(page_id, pages_[frame_id].GetData());
+    replacer_->Pin(frame_id); // remove from lru_list_
+
     return &pages_[frame_id];
   }
-  return nullptr;
 }
 
 /**
@@ -90,31 +88,35 @@ Page *BufferPoolManager::NewPage(page_id_t &page_id) {
   if (index == pool_size_) {
     return nullptr;
   }
-
-  page_id = AllocatePage(); // 0
-
-  bool from_free_list = false;
-  if (page_id == INVALID_PAGE_ID ) { // 1
+  if (replacer_->Size() + free_list_.size() <= 0) {
     return nullptr;
   }
+  page_id_t new_page_id = AllocatePage();
+
 
   frame_id_t frame_id;
   frame_id = TryToFindFreePage(); // 2
-
-  if (pages_[frame_id].IsDirty()) {
-    FlushPage(pages_[frame_id].GetPageId());
-    pages_[frame_id].is_dirty_ = false;
+  if (frame_id == INVALID_FRAME_ID) {
+    return nullptr;
   }
-  
+
+  if (pages_[frame_id].IsDirty()) { // lru
+    // disk_manager_->WritePage(pages_[frame_id].page_id_, pages_[frame_id].data_);
+    FlushPage(pages_[frame_id].page_id_);
+  }
   page_table_.erase(pages_[frame_id].GetPageId());
-  page_table_.insert({page_id, frame_id});
-  pages_[frame_id].page_id_ = page_id;
-  pages_[frame_id].pin_count_ = 1;
-  pages_[frame_id].is_dirty_ = false;
-  replacer_->Pin(frame_id);
+
   pages_[frame_id].ResetMemory();
+  page_table_.insert({new_page_id, frame_id});
+  page_id = new_page_id;
+  pages_[frame_id].page_id_ = new_page_id;
+  pages_[frame_id].pin_count_  = 1;
+  pages_[frame_id].is_dirty_ = false;
+
+  // replacer_->Unpin(frame_id);
+  replacer_->Pin(frame_id);
+
   return &(pages_[frame_id]);
-  
 }
 
 /**
@@ -127,11 +129,9 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
   // 2.   If P exists, but has a non-zero pin-count, return false. Someone is using the page.
   // 3.   Otherwise, P can be deleted. Remove P from the page table, reset its metadata and return it to the free list.
 
-  DeallocatePage(page_id); // 0
-  if (page_id == INVALID_PAGE_ID) {
-    return true;
-  }
 
+  if (page_id == INVALID_PAGE_ID)
+    return true;
   if (page_table_.find(page_id) == page_table_.end()) { // 1
     return true;
   }
@@ -140,24 +140,26 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
 
   if (pages_[frame_id].pin_count_ != 0) { // 2
     return false;
-  } 
-  if (pages_[frame_id].IsDirty()) {
-    FlushPage(page_id);
-    pages_[frame_id].is_dirty_ = false;
   }
+  // if (pages_[frame_id].IsDirty()) {
+  //   FlushPage(pages_[frame_id].GetPageId());
+  // }
+
+  DeallocatePage(page_id); // 0
   page_table_.erase(page_id);
   pages_[frame_id].page_id_ = INVALID_PAGE_ID;
   pages_[frame_id].pin_count_ = 0;
   pages_[frame_id].is_dirty_ = false;
   pages_[frame_id].ResetMemory();
   free_list_.emplace_back(frame_id);
+  dynamic_cast<LRUReplacer*>(replacer_)->Remove(frame_id);
   return true;
 }
 
 /**
  * TODO: Student Implement
  */
-bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) { 
+bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
   if (page_table_.find(page_id) == page_table_.end()) {
     return true;
   }
@@ -171,31 +173,34 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
     return false;
   }
   if (is_dirty) {
-    pages_[frame_id].is_dirty_ = is_dirty;
+    pages_[frame_id].is_dirty_ = true;
+  } else {
+    pages_[frame_id].is_dirty_ = false;
   }
   pages_[frame_id].pin_count_--;
   if (pages_[frame_id].pin_count_ == 0) {
     replacer_->Unpin(frame_id);
   }
-  
 
-  return true; 
+
+  return true;
 }
 
 /**
  * TODO: Student Implement
  */
-bool BufferPoolManager::FlushPage(page_id_t page_id) { 
+bool BufferPoolManager::FlushPage(page_id_t page_id) {
   if (page_table_.find(page_id) == page_table_.end()) {
     return false;
   }
   if (page_id == INVALID_PAGE_ID) {
     return false;
   }
-  disk_manager_->WritePage(page_id, pages_[page_table_[page_id]].GetData());
-  pages_[page_table_[page_id]].is_dirty_ = false;
+  frame_id_t frame_id = page_table_[page_id];
+  disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
+  pages_[frame_id].is_dirty_ = false;
 
-  return true; 
+  return true;
 }
 
 frame_id_t BufferPoolManager::TryToFindFreePage() {

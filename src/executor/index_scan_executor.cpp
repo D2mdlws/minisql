@@ -49,8 +49,14 @@ vector<RowId> IndexScanExecutor::IndexScan(AbstractExpressionRef predicate) {
     case ExpressionType::LogicExpression: {
       vector<RowId> lhs = IndexScan(predicate->GetChildAt(0));
       vector<RowId> rhs = IndexScan(predicate->GetChildAt(1));
-      if (lhs.empty()) return rhs;
-      if (rhs.empty()) return lhs;
+      // if (lhs.empty()) return rhs;
+      // if (rhs.empty()) return lhs;
+
+      // Bug Fixed:
+      if (plan_->need_filter_) {
+        if (lhs.empty()) return rhs;
+        if (rhs.empty()) return lhs;
+      }
       sort(lhs.begin(), lhs.end(), RowidCompare());
       sort(rhs.begin(), rhs.end(), RowidCompare());
       vector<RowId> result;
@@ -85,6 +91,7 @@ bool IndexScanExecutor::Next(Row *row, RowId *rid) {
     if (plan_->need_filter_) {
       if (!predicate->Evaluate(p_row).CompareEquals(Field(kTypeInt, 1))) {
         cursor_++;
+        delete p_row;
         continue;
       }
     }
@@ -95,6 +102,7 @@ bool IndexScanExecutor::Next(Row *row, RowId *rid) {
       *row = *p_row;
     }
     cursor_++;
+    delete p_row;
     return true;
   }
   return false;

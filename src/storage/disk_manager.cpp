@@ -64,23 +64,26 @@ page_id_t DiskManager::AllocatePage() {
   if (meta_page->GetAllocatedPages() >= MAX_VALID_PAGE_ID) {
     return INVALID_PAGE_ID;
   }
-  
+
   for (i = 0; i < meta_page->GetExtentNums(); i++) {
     // i for extent id
     if (meta_page->GetExtentUsedPage(i) < BITMAP_SIZE) { // 当前extent还有空闲的page
       meta_page->num_allocated_pages_++;
       meta_page->extent_used_page_[i]++; // 当前extent已经使用的page数+1
-      
+
       if (meta_page->extent_used_page_[i] == 1) {
         meta_page->num_extents_++; //如果该扩展之前没有被使用过，则增加扩展数量的计数器
       }
 
-      physical_page_id = i * (BITMAP_SIZE + 1/*bitmap page is 4kB size*/) + 1/*meta data page*/; // write a bitmap page 
+      physical_page_id = i * (BITMAP_SIZE + 1/*bitmap page is 4kB size*/) + 1/*meta data page*/; // write a bitmap page
       ReadPhysicalPage(physical_page_id, buffer); //读取bitmap page
 
       bitmap = reinterpret_cast<BitmapPage<PAGE_SIZE>*>(buffer);
       if (bitmap->AllocatePage(page_offset)) {
+
         WritePhysicalPage(physical_page_id, buffer);
+        WritePhysicalPage(META_PAGE_ID, meta_data_); // write meta data page
+        LOG(WARNING) << "dskmgr : Allocate logical page: " << i * BITMAP_SIZE + page_offset << std::endl;
         return i * BITMAP_SIZE + page_offset; // logical page id
       } else {
         LOG(ERROR) << "Failed to allocate page in bitmap" << std::endl;
@@ -98,6 +101,8 @@ page_id_t DiskManager::AllocatePage() {
   bitmap = reinterpret_cast<BitmapPage<PAGE_SIZE>*>(buffer);
   if (bitmap->AllocatePage(page_offset)) {
     WritePhysicalPage(physical_page_id, buffer);
+    WritePhysicalPage(META_PAGE_ID, meta_data_); // write meta data page
+    LOG(WARNING) << "dskmgr : Allocate logical page: " << i * BITMAP_SIZE + page_offset << std::endl;
     return i * BITMAP_SIZE + page_offset;
   } else {
     LOG(ERROR) << "Failed to allocate page in bitmap" << std::endl;
@@ -106,13 +111,14 @@ page_id_t DiskManager::AllocatePage() {
   return INVALID_PAGE_ID;
 }
 
+
 /**
  * TODO: Student Implement
  */
 void DiskManager::DeAllocatePage(page_id_t logical_page_id) {
 
   DiskFileMetaPage* meta_page = reinterpret_cast<DiskFileMetaPage*>(meta_data_);
-  uint32_t extent_id = logical_page_id / BITMAP_SIZE; 
+  uint32_t extent_id = logical_page_id / BITMAP_SIZE;
   uint32_t page_offset;
 
   if (extent_id >= meta_page->GetExtentNums()) { // 0 ~ extent_num - 1
@@ -127,14 +133,15 @@ void DiskManager::DeAllocatePage(page_id_t logical_page_id) {
   BitmapPage<PAGE_SIZE>* bitmap = reinterpret_cast<BitmapPage<PAGE_SIZE>*>(buffer);
 
   page_offset = MapPageId(logical_page_id) - physical_page_id - 1;
-  
+
   if (bitmap->DeAllocatePage(page_offset)) {
-    WritePhysicalPage(physical_page_id, buffer);
     meta_page->num_allocated_pages_--;
     meta_page->extent_used_page_[extent_id]--;
     if (meta_page->extent_used_page_[extent_id] == 0) {
       meta_page->num_extents_--;
     }
+    WritePhysicalPage(physical_page_id, buffer);
+    WritePhysicalPage(META_PAGE_ID, meta_data_); // write meta data page
   } else {
     LOG(ERROR) << "Failed to deallocate page in bitmap" << std::endl;
   }
@@ -142,7 +149,7 @@ void DiskManager::DeAllocatePage(page_id_t logical_page_id) {
 
 /**
  * TODO: Student Implement
- * logical_page_id: 0123  4567  89... 
+ * logical_page_id: 0123  4567  89...
  * logical_page_id / BITMAP_SIZE = extent_id indicate which extent the page is located
  */
 bool DiskManager::IsPageFree(page_id_t logical_page_id) {

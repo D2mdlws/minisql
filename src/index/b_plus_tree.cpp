@@ -17,15 +17,54 @@ BPlusTree::BPlusTree(index_id_t index_id, BufferPoolManager *buffer_pool_manager
       processor_(KM),
       leaf_max_size_(leaf_max_size),
       internal_max_size_(internal_max_size) {
+  auto page = buffer_pool_manager->FetchPage(INDEX_ROOTS_PAGE_ID);//该页存储所有索引的索引号及对应的根节点的页号
+  if(page != nullptr){
+    page_id_t tmp_root_id;
+    auto tmp_page = reinterpret_cast<IndexRootsPage *>(page);
+    if(tmp_page->GetRootId(index_id, &tmp_root_id)){
+      root_page_id_ = tmp_root_id;//得到B+树的根页号
+    }else{
+      root_page_id_ = INVALID_PAGE_ID;//没有这个索引
+    }
+    buffer_pool_manager->UnpinPage(INDEX_ROOTS_PAGE_ID, false);
+  }
 }
 
 void BPlusTree::Destroy(page_id_t current_page_id) {
+  if(!IsEmpty()){
+    auto page = buffer_pool_manager_->FetchPage(current_page_id);
+    if(page != nullptr){
+      auto node = reinterpret_cast<BPlusTreePage *>(page->GetData());
+      if(node->IsLeafPage()){//是叶子页，下面再没有孩子页了
+        auto tmp_leaf_node = reinterpret_cast<LeafPage *>(page->GetData());
+        buffer_pool_manager_->DeletePage(current_page_id);
+      }else{
+        auto tmp_internal_node = reinterpret_cast<InternalPage *>(page->GetData());
+        for(int i = 0; i < tmp_internal_node->GetSize(); i++){
+          Destroy(tmp_internal_node->ValueAt(i));//递归删除孩子页
+        }
+        buffer_pool_manager_->DeletePage(current_page_id);
+      }
+      root_page_id_ = INVALID_PAGE_ID;
+      UpdateRootPageId(0);
+    }
+  }
 }
 
 /*
  * Helper function to decide whether current b+tree is empty
  */
 bool BPlusTree::IsEmpty() const {
+  if(root_page_id_ == INVALID_PAGE_ID){//空索引
+    return true;
+  }
+  auto tmp_page = buffer_pool_manager_->FetchPage(root_page_id_);
+  auto tmp_node = reinterpret_cast<BPlusTreePage *>(tmp_page->GetData());
+  if(tmp_node->GetSize() == 0){
+    buffer_pool_manager_->UnpinPage(root_page_id_, false);
+    return true;
+  }
+  buffer_pool_manager_->UnpinPage(root_page_id_, false);
   return false;
 }
 
@@ -37,7 +76,31 @@ bool BPlusTree::IsEmpty() const {
  * This method is used for point query
  * @return : true means key exists
  */
-bool BPlusTree::GetValue(const GenericKey *key, std::vector<RowId> &result, Txn *transaction) { return false; }
+bool BPlusTree::GetValue(const GenericKey *key, std::vector<RowId> &result, Txn *transaction) {
+  if(!IsEmpty()){//索引不为空
+    auto tmp_res_page = FindLeafPage(key, root_page_id_);
+    auto tmp_leaf_page = buffer_pool_manager_->FetchPage(tmp_res_page->GetPageId());//固定该页
+    auto tmp_leaf_node = reinterpret_cast<BPlusTreeLeafPage *>(tmp_leaf_page->GetData());
+    RowId tmp_res;
+    int found = 0;
+    tmp_leaf_page->RLatch();
+    if(tmp_leaf_node->Lookup(key, tmp_res, processor_)){//在叶子页中找到
+      found = 1;
+      result.emplace_back(tmp_res);
+    }else{//在叶子页中未找到
+      found = 0;
+    }
+    tmp_leaf_page->RUnlatch();
+    buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), false);//释放该页
+    if(found){
+      return true;
+    }else{
+      return false;
+    }
+  }else{//索引为空
+    return false;
+  }
+}
 
 /*****************************************************************************
  * INSERTION
@@ -49,14 +112,35 @@ bool BPlusTree::GetValue(const GenericKey *key, std::vector<RowId> &result, Txn 
  * @return: since we only support unique key, if user try to insert duplicate
  * keys return false, otherwise return true.
  */
-bool BPlusTree::Insert(GenericKey *key, const RowId &value, Txn *transaction) { return false; }
+bool BPlusTree::Insert(GenericKey *key, const RowId &value, Txn *transaction) {
+  if(IsEmpty()){
+    StartNewTree(key, value);
+    return true;
+  }else{
+    return InsertIntoLeaf(key, value, transaction);
+  }
+}
 /*
  * Insert constant key & value pair into an empty tree
  * User needs to first ask for new page from buffer pool manager(NOTICE: throw
  * an "out of memory" exception if returned value is nullptr), then update b+
  * tree's root page id and insert entry directly into leaf page.
  */
-void BPlusTree::StartNewTree(GenericKey *key, const RowId &value) {}
+void BPlusTree::StartNewTree(GenericKey *key, const RowId &value) {
+  auto page = buffer_pool_manager_->NewPage(root_page_id_);//得到一个新的页
+  if(page){
+    auto node = reinterpret_cast<LeafPage *>(page->GetData());
+    //预留一些空间以免异常
+    leaf_max_size_ = (PAGE_SIZE - LEAF_PAGE_HEADER_SIZE) / (processor_.GetKeySize() + sizeof(RowId));
+    internal_max_size_ = (PAGE_SIZE - INTERNAL_PAGE_HEADER_SIZE) / (processor_.GetKeySize() + sizeof(RowId)) - 1;
+    node->Init(root_page_id_, INVALID_PAGE_ID, processor_.GetKeySize(), leaf_max_size_);
+    node->Insert(key, value, processor_);
+    UpdateRootPageId(1);//新建了一个索引，应该在索引根页中插入
+    buffer_pool_manager_->UnpinPage(root_page_id_, true);
+  }else{
+    LOG(ERROR)<<"out of memory"<<std::endl;
+  }
+}
 
 /*
  * Insert constant key & value pair into leaf page
@@ -66,7 +150,35 @@ void BPlusTree::StartNewTree(GenericKey *key, const RowId &value) {}
  * @return: since we only support unique key, if user try to insert duplicate
  * keys return false, otherwise return true.
  */
-bool BPlusTree::InsertIntoLeaf(GenericKey *key, const RowId &value, Txn *transaction) { return false; }
+bool BPlusTree::InsertIntoLeaf(GenericKey *key, const RowId &value, Txn *transaction) {
+  if(IsEmpty()){//索引为空
+    return false;
+  }
+  auto tmp_res_page = FindLeafPage(key, root_page_id_);
+  auto page = buffer_pool_manager_->FetchPage(tmp_res_page->GetPageId());//固定该页
+  auto leaf_node = reinterpret_cast<LeafPage *>(page->GetData());
+  page->WLatch();
+  RowId target_rowid;
+  if(leaf_node->Lookup(key, target_rowid, processor_)){
+    //原来就有
+    page->WUnlatch();
+    buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), false);
+    return false;
+  }else{
+    //原来没有，可以插入
+    int leaf_current_size = leaf_node->Insert(key, value, processor_);
+    if(leaf_current_size >= leaf_max_size_){//插入后要分裂
+      auto new_sibling = Split(leaf_node, transaction);
+      //维护分裂后父页数据
+      auto new_sibling_key = new_sibling->KeyAt(0);
+      InsertIntoParent(leaf_node, new_sibling_key, new_sibling, transaction);
+    }
+    //插入后不分裂
+    page->WUnlatch();
+    buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), true);
+    return true;
+  }
+}
 
 /*
  * Split input page and return newly created page.
@@ -75,9 +187,48 @@ bool BPlusTree::InsertIntoLeaf(GenericKey *key, const RowId &value, Txn *transac
  * an "out of memory" exception if returned value is nullptr), then move half
  * of key & value pairs from input page to newly created page
  */
-BPlusTreeInternalPage *BPlusTree::Split(InternalPage *node, Txn *transaction) { return nullptr; }
+BPlusTreeInternalPage *BPlusTree::Split(InternalPage *node, Txn *transaction) {
+  //把传入页的数据分一半到新申请的页中
+  //该函数未维护分裂后父页数据
+  auto old_page = buffer_pool_manager_->FetchPage(node->GetPageId());//固定旧页
+  page_id_t new_page_id;
+  auto new_page = buffer_pool_manager_->NewPage(new_page_id);//得到新页
+  if(new_page == nullptr){
+    LOG(ERROR)<<"out of memory"<<std::endl;
+    return nullptr;
+  }else{
+    auto new_node = reinterpret_cast<InternalPage *>(new_page->GetData());
+    new_node->SetPageType(IndexPageType::INTERNAL_PAGE);
+    new_node->Init(new_page_id, node->GetParentPageId(), node->GetKeySize(), internal_max_size_);
+    node->MoveHalfTo(new_node, buffer_pool_manager_);//把node的后半段移到new_node（一定为空）的后半段，故相当于前半段
+    buffer_pool_manager_->UnpinPage(new_page_id, true);//释放旧页
+    buffer_pool_manager_->UnpinPage(node->GetPageId(), true);//释放新页
+    return new_node;//返回新建节点指针
+  }
+}
 
-BPlusTreeLeafPage *BPlusTree::Split(LeafPage *node, Txn *transaction) { return nullptr; }
+BPlusTreeLeafPage *BPlusTree::Split(LeafPage *node, Txn *transaction) {
+  //把传入页的数据分一半到新申请的页中
+  //该函数未维护分裂后父页数据
+  auto old_page = buffer_pool_manager_->FetchPage(node->GetPageId());//固定旧页
+  page_id_t new_page_id;
+  auto new_page = buffer_pool_manager_->NewPage(new_page_id);//得到新页
+  if(new_page == nullptr){
+    LOG(ERROR)<<"out of memory"<<std::endl;
+    return nullptr;
+  }else{
+    auto new_node = reinterpret_cast<LeafPage *>(new_page->GetData());
+    new_node->SetPageType(IndexPageType::LEAF_PAGE);
+    new_node->Init(new_page_id, node->GetParentPageId(), node->GetKeySize(), leaf_max_size_);//new_node和node性质一样
+    node->MoveHalfTo(new_node);
+    //把叶子页连起来
+    new_node->SetNextPageId(node->GetNextPageId());
+    node->SetNextPageId(new_page_id);
+    buffer_pool_manager_->UnpinPage(node->GetPageId(), true);//释放旧页
+    buffer_pool_manager_->UnpinPage(new_page_id, true);//释放新页
+    return new_node;//返回新建节点指针
+  }
+}
 
 /*
  * Insert key & value pair into internal page after split
@@ -88,7 +239,33 @@ BPlusTreeLeafPage *BPlusTree::Split(LeafPage *node, Txn *transaction) { return n
  * adjusted to take info of new_node into account. Remember to deal with split
  * recursively if necessary.
  */
-void BPlusTree::InsertIntoParent(BPlusTreePage *old_node, GenericKey *key, BPlusTreePage *new_node, Txn *transaction) {}
+void BPlusTree::InsertIntoParent(BPlusTreePage *old_node, GenericKey *key, BPlusTreePage *new_node, Txn *transaction) {
+  if(old_node->IsRootPage()){//老根分裂了，须创建新根
+    auto new_page = buffer_pool_manager_->NewPage(root_page_id_);
+    auto new_root = reinterpret_cast<InternalPage *>(new_page->GetData());
+    new_root->SetPageType(IndexPageType::INTERNAL_PAGE);
+    new_root->Init(root_page_id_, INVALID_PAGE_ID, processor_.GetKeySize(), internal_max_size_);
+    new_root->PopulateNewRoot(old_node->GetPageId(), key, new_node->GetPageId());
+    old_node->SetParentPageId(new_root->GetPageId());
+    new_node->SetParentPageId(new_root->GetPageId());
+    buffer_pool_manager_->UnpinPage(new_root->GetPageId(), true);
+    UpdateRootPageId(0);//属于根的更新，因为有老根
+  }else{//老节点非根
+    auto parent_page = buffer_pool_manager_->FetchPage(old_node->GetParentPageId());
+    auto parent = reinterpret_cast<InternalPage *>(parent_page->GetData());
+    int parent_current_size = parent->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId());
+    if(parent_current_size > internal_max_size_){//父节点递归分裂
+      auto new_parent_sibling = Split(parent, transaction);
+      auto key = new_parent_sibling->KeyAt(0);
+      InsertIntoParent(parent, key, new_parent_sibling, transaction);
+      buffer_pool_manager_->UnpinPage(parent_page->GetPageId(), true);
+    }else{//父节点不递归分裂
+      old_node->SetParentPageId(parent->GetPageId());
+      new_node->SetParentPageId(parent->GetPageId());
+      buffer_pool_manager_->UnpinPage(parent_page->GetPageId(), true);
+    }
+  }
+}
 
 /*****************************************************************************
  * REMOVE
@@ -100,7 +277,30 @@ void BPlusTree::InsertIntoParent(BPlusTreePage *old_node, GenericKey *key, BPlus
  * delete entry from leaf page. Remember to deal with redistribute or merge if
  * necessary.
  */
-void BPlusTree::Remove(const GenericKey *key, Txn *transaction) {}
+void BPlusTree::Remove(const GenericKey *key, Txn *transaction) {
+  if(IsEmpty()){
+    return;
+  }
+  auto tmp_res_page = FindLeafPage(key, root_page_id_);
+  auto page = buffer_pool_manager_->FetchPage(tmp_res_page->GetPageId());//固定该页
+  auto leaf_node = reinterpret_cast<LeafPage *>(page->GetData());
+  page->WLatch();
+  int leaf_node_old_size = leaf_node->GetSize();
+  int leaf_node_current_size = leaf_node->RemoveAndDeleteRecord(key, processor_);
+  if(leaf_node_current_size < leaf_node_old_size){//找到并删了
+    page->WUnlatch();
+    bool should_be_deleted = false;
+    if(leaf_node_current_size < leaf_node->GetMinSize()){//需要合并或分配
+      should_be_deleted = CoalesceOrRedistribute(leaf_node, transaction);//会处理DeletePage的情况
+    }
+    if(!should_be_deleted){
+      buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), true);
+    }
+  }else{//原来就没有
+    page->WUnlatch();
+    buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), false);
+  }
+}
 
 /* todo
  * User needs to first find the sibling of input page. If sibling's size + input
@@ -111,7 +311,89 @@ void BPlusTree::Remove(const GenericKey *key, Txn *transaction) {}
  */
 template <typename N>
 bool BPlusTree::CoalesceOrRedistribute(N *&node, Txn *transaction) {
-  return false;
+  if(IsEmpty()){//空索引
+    return false;
+  }
+  if(node->GetSize() >= node->GetMinSize()) {
+    return false;
+  }
+  if(node->IsRootPage()){
+    if(node->GetSize() == 1){//根节点只有一个K-V对且Key无效
+      if(AdjustRoot(node)){//应删
+        buffer_pool_manager_->DeletePage(node->GetPageId());
+        return true;
+      }
+    }
+    return false;
+  }
+  auto parent_node_page = buffer_pool_manager_->FetchPage(node->GetParentPageId());
+  auto parent_node = reinterpret_cast<InternalPage *>(parent_node_page->GetData());
+  int node_index = parent_node->ValueIndex(node->GetPageId());
+  if(node_index == 0){//只有右兄弟
+    auto sibling_node = reinterpret_cast<N *>(buffer_pool_manager_->FetchPage(parent_node->ValueAt(1)));
+    if(node->IsLeafPage() ? ((sibling_node->GetSize() + node->GetSize()) < node->GetMaxSize()) : ((sibling_node->GetSize() + node->GetSize()) <= node->GetMaxSize())){
+      //可合并
+      bool should_be_deleted = false;
+      should_be_deleted = Coalesce(node, sibling_node, parent_node, 1, transaction);//会处理DeletePage的情况
+      if(!should_be_deleted){
+        buffer_pool_manager_->UnpinPage(node->GetParentPageId(), true);
+      }
+      return false;//node未被删除
+    }else{
+      //须分配
+      buffer_pool_manager_->UnpinPage(node->GetParentPageId(), false);
+      Redistribute(sibling_node, node, 0);//维护父节点数据
+      buffer_pool_manager_->UnpinPage(parent_node->ValueAt(1), true);
+      return false;//node未被删除
+    }
+  }
+  if(node_index == (parent_node->GetSize() - 1)){
+    auto sibling_node = reinterpret_cast<N *>(buffer_pool_manager_->FetchPage(parent_node->ValueAt(parent_node->GetSize() - 2)));
+    if(node->IsLeafPage() ? ((sibling_node->GetSize() + node->GetSize()) < node->GetMaxSize()) : ((sibling_node->GetSize() + node->GetSize()) <= node->GetMaxSize())){
+      //可合并
+      bool should_be_deleted = false;
+      should_be_deleted = Coalesce(sibling_node, node, parent_node, node_index, transaction);//会处理DeletePage的情况
+      if(!should_be_deleted){
+        buffer_pool_manager_->UnpinPage(node->GetParentPageId(), true);
+      }
+      buffer_pool_manager_->UnpinPage(parent_node->ValueAt(parent_node->GetSize() - 2), true);
+      return true;//node被删除
+    }else{
+      //须分配
+      buffer_pool_manager_->UnpinPage(node->GetParentPageId(), false);
+      Redistribute(sibling_node, node, 1);
+      buffer_pool_manager_->UnpinPage(sibling_node->GetPageId(), true);
+      return false;//node未被删除
+    }
+  }
+  auto sibling_node_1 = reinterpret_cast<N *>(buffer_pool_manager_->FetchPage(parent_node->ValueAt(node_index - 1)));
+  auto sibling_node_2 = reinterpret_cast<N *>(buffer_pool_manager_->FetchPage(parent_node->ValueAt(node_index + 1)));
+  if(node->IsLeafPage() ? ((sibling_node_1->GetSize() + node->GetSize()) < node->GetMaxSize()) : ((sibling_node_1->GetSize() + node->GetSize()) <= node->GetMaxSize())){
+    buffer_pool_manager_->UnpinPage(sibling_node_2->GetPageId(), false);
+    //可合并
+    bool should_be_deleted = false;
+    should_be_deleted = Coalesce(sibling_node_1, node, parent_node, node_index, transaction);//会处理DeletePage的情况
+    if(!should_be_deleted){
+      buffer_pool_manager_->UnpinPage(node->GetParentPageId(), true);
+    }
+    buffer_pool_manager_->UnpinPage(sibling_node_1->GetPageId(), true);
+    return true;//node被删除
+  }else if(node->IsLeafPage() ? ((sibling_node_2->GetSize() + node->GetSize()) < node->GetMaxSize()) : ((sibling_node_2->GetSize() + node->GetSize()) <= node->GetMaxSize())){
+    buffer_pool_manager_->UnpinPage(sibling_node_1->GetPageId(), false);
+    //可合并
+    bool should_be_deleted = false;
+    should_be_deleted = Coalesce(node, sibling_node_2, parent_node, node_index + 1, transaction);//会处理DeletePage的情况
+    if(!should_be_deleted){
+      buffer_pool_manager_->UnpinPage(node->GetParentPageId(), true);
+    }
+    return false;//node未被删除
+  }else{
+    buffer_pool_manager_->UnpinPage(sibling_node_2->GetPageId(), false);
+    buffer_pool_manager_->UnpinPage(node->GetParentPageId(), false);
+    Redistribute(sibling_node_1, node, 1);
+    buffer_pool_manager_->UnpinPage(sibling_node_1->GetPageId(), true);
+    return false;
+  }
 }
 
 /*
@@ -125,14 +407,26 @@ bool BPlusTree::CoalesceOrRedistribute(N *&node, Txn *transaction) {
  * @param   parent             parent page of input "node"
  * @return  true means parent node should be deleted, false means no deletion happened
  */
-bool BPlusTree::Coalesce(LeafPage *&neighbor_node, LeafPage *&node, InternalPage *&parent, int index,
-                         Txn *transaction) {
-  return false;
+bool BPlusTree::Coalesce(LeafPage *&neighbor_node, LeafPage *&node, InternalPage *&parent, int index, Txn *transaction) {
+  node->MoveAllTo(neighbor_node);//把node中的数据全部接到neighbor_node后面
+  buffer_pool_manager_->DeletePage(node->GetPageId());
+  parent->Remove(index);//更新父节点数据
+  if(parent->GetSize() >= parent->GetMinSize()){
+    return false;
+  }else{//递归处理父节点过小情况
+    return CoalesceOrRedistribute(parent, transaction);
+  }
 }
 
-bool BPlusTree::Coalesce(InternalPage *&neighbor_node, InternalPage *&node, InternalPage *&parent, int index,
-                         Txn *transaction) {
-  return false;
+bool BPlusTree::Coalesce(InternalPage *&neighbor_node, InternalPage *&node, InternalPage *&parent, int index, Txn *transaction) {
+  node->MoveAllTo(neighbor_node, parent->KeyAt(index), buffer_pool_manager_);
+  buffer_pool_manager_->DeletePage(node->GetPageId());
+  parent->Remove(index);
+  if(parent->GetSize() >= parent->GetMinSize()){
+    return false;
+  }else{
+    return CoalesceOrRedistribute(parent, transaction);
+  }
 }
 
 /*
@@ -144,9 +438,35 @@ bool BPlusTree::Coalesce(InternalPage *&neighbor_node, InternalPage *&node, Inte
  * @param   neighbor_node      sibling page of input "node"
  * @param   node               input from method coalesceOrRedistribute()
  */
-void BPlusTree::Redistribute(LeafPage *neighbor_node, LeafPage *node, int index) {
+void BPlusTree::Redistribute(LeafPage *neighbor_node, LeafPage *node, int index){//index是标志neighbor_node和node谁先谁后的
+  if(index){//neighbor_node在前，node在后
+    neighbor_node->MoveLastToFrontOf(node);//要改父节点
+    auto parent_node_page = buffer_pool_manager_->FetchPage(node->GetParentPageId());
+    auto parent_node = reinterpret_cast<InternalPage *>(parent_node_page->GetData());
+    parent_node->SetKeyAt(parent_node->ValueIndex(node->GetPageId()), node->KeyAt(0));
+    buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+  }else{//neighbor_node在后，node在前
+    neighbor_node->MoveFirstToEndOf(node);//要改父节点
+    auto parent_node_page = buffer_pool_manager_->FetchPage(neighbor_node->GetParentPageId());
+    auto parent_node = reinterpret_cast<InternalPage *>(parent_node_page->GetData());
+    parent_node->SetKeyAt(parent_node->ValueIndex(neighbor_node->GetPageId()), neighbor_node->KeyAt(0));
+    buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+  }
 }
-void BPlusTree::Redistribute(InternalPage *neighbor_node, InternalPage *node, int index) {
+void BPlusTree::Redistribute(InternalPage *neighbor_node, InternalPage *node, int index){
+  if(index){//neighbor_node在前，node在后
+    auto parent_node_page = buffer_pool_manager_->FetchPage(node->GetParentPageId());
+    auto parent_node = reinterpret_cast<InternalPage *>(parent_node_page->GetData());
+    neighbor_node->MoveLastToFrontOf(node, parent_node->KeyAt(parent_node->ValueIndex(node->GetPageId())), buffer_pool_manager_);
+    parent_node->SetKeyAt(parent_node->ValueIndex(node->GetPageId()), node->KeyAt(0));
+    buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+  }else{//neighbor_node在后，node在前
+    auto parent_node_page = buffer_pool_manager_->FetchPage(node->GetParentPageId());
+    auto parent_node = reinterpret_cast<InternalPage *>(parent_node_page->GetData());
+    neighbor_node->MoveFirstToEndOf(node, parent_node->KeyAt(parent_node->ValueIndex(neighbor_node->GetPageId())), buffer_pool_manager_);
+    parent_node->SetKeyAt(parent_node->ValueIndex(neighbor_node->GetPageId()), neighbor_node->KeyAt(0));
+    buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+  }
 }
 /*
  * Update root page if necessary
@@ -158,7 +478,22 @@ void BPlusTree::Redistribute(InternalPage *neighbor_node, InternalPage *node, in
  * @return : true means root page should be deleted, false means no deletion
  * happened
  */
-bool BPlusTree::AdjustRoot(BPlusTreePage *old_root_node) {
+bool BPlusTree::AdjustRoot(BPlusTreePage *old_root_node){
+  if(old_root_node->GetSize() == 1){
+    if(old_root_node->IsLeafPage()){//整个索引就剩下一个键值
+      return false;//这种情况是正常的，不应删
+    }else{//应删
+      auto tmp_root_node = reinterpret_cast<InternalPage *>(old_root_node);
+      page_id_t root_page_id = tmp_root_node->RemoveAndReturnOnlyChild();
+      auto new_root_node_page = buffer_pool_manager_->FetchPage(root_page_id);
+      auto new_root_node = reinterpret_cast<BPlusTreePage *>(new_root_node_page->GetData());
+      new_root_node->SetParentPageId(INVALID_PAGE_ID);//变成根了
+      root_page_id_ = new_root_node->GetPageId();//新的根页号
+      buffer_pool_manager_->UnpinPage(root_page_id_, true);
+      UpdateRootPageId(0);
+      return true;
+    }
+  }
   return false;
 }
 
@@ -171,7 +506,11 @@ bool BPlusTree::AdjustRoot(BPlusTreePage *old_root_node) {
  * @return : index iterator
  */
 IndexIterator BPlusTree::Begin() {
-  return IndexIterator();
+  auto tmp_res_page = FindLeafPage(nullptr, root_page_id_, true);
+  auto leaf_node_page = buffer_pool_manager_->FetchPage(tmp_res_page->GetPageId());//固定该页
+  auto leaf_node = reinterpret_cast<LeafPage *>(leaf_node_page->GetData());
+  buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), false);
+  return IndexIterator(leaf_node->GetPageId(), buffer_pool_manager_);
 }
 
 /*
@@ -180,7 +519,11 @@ IndexIterator BPlusTree::Begin() {
  * @return : index iterator
  */
 IndexIterator BPlusTree::Begin(const GenericKey *key) {
-   return IndexIterator();
+  auto tmp_res_page = FindLeafPage(key, root_page_id_, false);
+  auto leaf_node_page = buffer_pool_manager_->FetchPage(tmp_res_page->GetPageId());//固定该页
+  auto leaf_node = reinterpret_cast<LeafPage *>(leaf_node_page->GetData());
+  buffer_pool_manager_->UnpinPage(tmp_res_page->GetPageId(), false);
+  return IndexIterator(leaf_node->GetPageId(), buffer_pool_manager_, leaf_node->KeyIndex(key, processor_));
 }
 
 /*
@@ -189,7 +532,7 @@ IndexIterator BPlusTree::Begin(const GenericKey *key) {
  * @return : index iterator
  */
 IndexIterator BPlusTree::End() {
-  return IndexIterator();
+  return IndexIterator(INVALID_PAGE_ID, buffer_pool_manager_, 0);
 }
 
 /*****************************************************************************
@@ -201,7 +544,21 @@ IndexIterator BPlusTree::End() {
  * Note: the leaf page is pinned, you need to unpin it after use.
  */
 Page *BPlusTree::FindLeafPage(const GenericKey *key, page_id_t page_id, bool leftMost) {
-  return nullptr;
+  auto tmp_page = buffer_pool_manager_->FetchPage(page_id);
+  auto tmp_node = reinterpret_cast<BPlusTreePage *>(tmp_page->GetData());
+  tmp_page->RLatch();
+  if(tmp_node->IsLeafPage()){//传入的page_id对应的就是叶子页
+    tmp_page->RUnlatch();
+    buffer_pool_manager_->UnpinPage(page_id, false);
+    return tmp_page;
+  }
+  //传入的page_id对应的是内部页
+  auto tmp_internal_node = reinterpret_cast<InternalPage *>(tmp_node);
+  //考虑leftMost
+  page_id_t tmp_child_id = (leftMost ? tmp_internal_node->ValueAt(0) : tmp_internal_node->Lookup(key, processor_));
+  tmp_page->RUnlatch();
+  buffer_pool_manager_->UnpinPage(page_id, false);
+  return FindLeafPage(key, tmp_child_id, leftMost);//递归查找
 }
 
 /*
@@ -213,6 +570,13 @@ Page *BPlusTree::FindLeafPage(const GenericKey *key, page_id_t page_id, bool lef
  * updating it.
  */
 void BPlusTree::UpdateRootPageId(int insert_record) {
+  auto header_page = reinterpret_cast<IndexRootsPage *>(buffer_pool_manager_->FetchPage(INDEX_ROOTS_PAGE_ID));
+  if(insert_record){
+    header_page->Insert(index_id_, root_page_id_);
+  }else{
+    header_page->Update(index_id_, root_page_id_);
+  }
+  buffer_pool_manager_->UnpinPage(INDEX_ROOTS_PAGE_ID, true);
 }
 
 /**
@@ -341,3 +705,4 @@ bool BPlusTree::Check() {
   }
   return all_unpinned;
 }
+

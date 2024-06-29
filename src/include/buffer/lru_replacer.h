@@ -33,11 +33,16 @@ class LRUReplacer : public Replacer {
 
   void Unpin(frame_id_t frame_id) override;
 
+ void Remove(frame_id_t frame_id) {
+  lru_list_.erase(frame_id);
+ }
+
   size_t Size() override;
 
 private:
   // add your own private member variables here
   unordered_set<frame_id_t> lru_list_;
+ size_t num_pages_;
 };
 
 #endif  // MINISQL_LRU_REPLACER_H

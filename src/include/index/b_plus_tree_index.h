@@ -23,6 +23,8 @@ class BPlusTreeIndex : public Index {
 
   IndexIterator GetEndIterator();
 
+  BPlusTree GetContainer() { return container_; }
+
  protected:
   // comparator for key
   KeyManager processor_;

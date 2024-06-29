@@ -75,6 +75,7 @@ class LockManager {
 
    public:
     ReqListType req_list_{};
+    // 事务ID到请求队列迭代器的映射,用来找到请求队列中的请求
     std::unordered_map<txn_id_t, ReqListType::iterator> req_list_iter_map_{};
 
     // for notify blocked txn on this rid.
@@ -173,10 +174,12 @@ class LockManager {
    * the lowest transaction id. This also means when exploring neighbors, explore them in sorted order
    * from lowest to highest.
    */
-  bool DFS(txn_id_t txn_id);
+  bool SearchCycle(txn_id_t txn_id);
 
  private:
   /** Lock table for lock requests. */
+  // rowid表示一个数据对象，lock_request_queue表示对这个数据对象的请求队列
+  // 每个数据对象对应一个请求队列，这些数据对象组成在一起就形成了一个map，有点像邻接表的形状
   std::unordered_map<RowId, LockRequestQueue> lock_table_{};
   std::mutex latch_{};
 

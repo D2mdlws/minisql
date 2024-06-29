@@ -27,7 +27,7 @@ pSyntaxNode CreateSyntaxNode(SyntaxNodeType type, char *val) {
       size_t len = strlen(val) + 1;
       node->val_ = (char *)malloc(len);
       strcpy(node->val_, val);
-      node->val_[len] = '\0';
+      node->val_[len - 1] = '\0';
     }
   } else {
     node->val_ = NULL;
@@ -66,6 +66,7 @@ void DestroySyntaxTree() {
   while (p != NULL) {
     pSyntaxNodeList next = p->next_;
     FreeSyntaxNode(p->node_);
+    free(p);
     p = next;
   }
   minisql_parser_syntax_node_list_ = NULL;
